@@ -1,0 +1,17 @@
+.d-header {
+    color: white;
+}
+
+thead tr:nth-child(1) th {
+    background: white;
+    position: sticky;
+    top: 5em;
+    z-index: 10;
+}
+
+tbody tr {
+    position: sticky;
+    top: 5em;
+    z-index: 0;
+    white-space: nowrap;
+}
