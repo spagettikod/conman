@@ -1,41 +1,33 @@
-import { ContainerCard } from './ContainerCard.js'
-
 var app;
 
 function init() {
     app = new Vue({
         el: '#app',
         data: {
-            containers: [],
+            services: [],
             filterValue: ''
         },
-        components: {
-            'container-card': ContainerCard
-        },
         computed: {
-            'filteredContainers': function () {
+            'filteredServices': function () {
                 let v = this.filterValue.toLowerCase();
-                return this.containers.filter(function (c) {
+                return this.services.filter(function (svc) {
                     if (v === '') {
-                        return c;
+                        return svc;
                     }
-                    if (c.name.toLowerCase().indexOf(v) > -1) {
-                        return c;
+                    if (svc.name.toLowerCase().indexOf(v) > -1) {
+                        return svc;
                     }
-                    if (c.image.toLowerCase().indexOf(v) > -1) {
-                        return c;
-                    }
-                    if (c.state.toLowerCase().startsWith(v)) {
-                        return c;
+                    if (svc.image.toLowerCase().indexOf(v) > -1) {
+                        return svc;
                     }
                 });
             }
         },
         beforeMount: async function () {
-            this.load();
+            this.loadServices();
         },
         mounted: function () {
-            window.setInterval(this.load, 1000);
+            window.setInterval(this.loadServices, 3000);
         },
         methods: {
             filterChanged: function (e) {
@@ -43,31 +35,10 @@ function init() {
                     e.target.value = '';
                 }
             },
-            stateClass: function (state) {
-                switch (state) {
-                    case 'running':
-                        return 'badge-success';
-                    case 'created':
-                        return 'badge-warning';
-                    case 'paused':
-                        return 'badge-warning';
-                    case 'exited':
-                        return 'badge-danger';
-                    case 'dead':
-                        return 'badge-danger';
-                    default:
-                        return 'badge-light';
-                }
-            },
-            load: async function () {
-                let response = await fetch('/api/containers');
-                this.containers = await response.json();
-            },
-            action: async function (link) {
-                let response = await fetch(link.href, { method: link.type });
+            loadServices: async function () {
+                let response = await fetch('/api/services');
                 if (response.ok) {
-                    this.load();
-                    return;
+                    this.services = await response.json();
                 }
             },
             downloadLog: async function (link) {

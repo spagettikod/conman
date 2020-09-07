@@ -25,8 +25,12 @@ type containerLinks struct {
 	DownloadLog *hateoasLink `json:"downloadLog,omitempty"`
 }
 
-func newDownloadLogLink(id string) *hateoasLink {
+func newDownloadContainerLogLink(id string) *hateoasLink {
 	return &hateoasLink{Href: fmt.Sprintf("/api/containers/%s/log/download", id), Rel: "downloadLog", Type: "GET"}
+}
+
+func newDownloadServiceLogLink(id string) *hateoasLink {
+	return &hateoasLink{Href: fmt.Sprintf("/api/services/%s/log/download", id), Rel: "downloadLog", Type: "GET"}
 }
 
 type container struct {
@@ -38,51 +42,50 @@ type container struct {
 	Links  containerLinks `json:"links"`
 }
 
-type Authenticator interface {
-	IsAllowed(r *http.Request, containerID string) (bool, error)
+type Service struct {
+	ID    string         `json:"id"`
+	Name  string         `json:"name"`
+	Image string         `json:"image"`
+	Links containerLinks `json:"links"`
 }
 
-type NoOpAuthenticator struct {
-}
-
-func (noa NoOpAuthenticator) IsAllowed(r *http.Request, containerID string) (bool, error) {
-	return true, nil
-}
-
-type HTTPHeaderAuthenticator struct {
-	HTTPHeader        string
-	ContainerLabelKey string
-}
-
-func (hha HTTPHeaderAuthenticator) IsAllowed(r *http.Request, containerID string) (bool, error) {
-	if len(r.Header[hha.HTTPHeader]) < 1 {
-		return false, nil
-	}
-	subject := r.Header[hha.HTTPHeader][0]
-	labelValue, err := getContainerLabel(hha.ContainerLabelKey, containerID)
-	if err != nil {
-		return false, err
-	}
-	return (subject == labelValue), nil
-}
-
-func getContainerLabel(labelKey, containerID string) (labelValue string, err error) {
-	cli, err := client.NewEnvClient()
-	if err != nil {
-		return
-	}
-	// TODO Is there no other way to get the labels, do I need to list?
-	containers, err := cli.ContainerList(context.Background(), types.ContainerListOptions{})
-	if err != nil {
-		return
-	}
-	for _, container := range containers {
-		if container.ID == containerID {
-			labelValue = container.Labels[labelKey]
-			return
+func listServices(auth Authenticator) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		cli, err := client.NewEnvClient()
+		if err != nil {
+			return err
 		}
+
+		serviceList, err := cli.ServiceList(context.Background(), types.ServiceListOptions{})
+		if err != nil {
+			return err
+		}
+
+		services := []Service{}
+		for _, svc := range serviceList {
+			service := Service{}
+			allowed, err := auth.IsServiceAllowed(r, svc.ID)
+			if err != nil {
+				return err
+			}
+			if !allowed {
+				continue
+			}
+			service.ID = svc.ID
+			service.Name = svc.Spec.Name
+			service.Image = svc.Spec.TaskTemplate.ContainerSpec.Image
+			service.Links.DownloadLog = newDownloadServiceLogLink(svc.ID)
+			services = append(services, service)
+		}
+		b, err := json.Marshal(services)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return err
+		}
+		w.Header().Set("Content-type", "application/json")
+		fmt.Fprint(w, string(b))
+		return nil
 	}
-	return
 }
 
 func listContainers(auth Authenticator) func(w http.ResponseWriter, r *http.Request) error {
@@ -99,7 +102,7 @@ func listContainers(auth Authenticator) func(w http.ResponseWriter, r *http.Requ
 
 		containers := []container{}
 		for _, c := range cs {
-			allowed, err := auth.IsAllowed(r, c.ID)
+			allowed, err := auth.IsContainerAllowed(r, c.ID)
 			if err != nil {
 				return err
 			}
@@ -118,7 +121,7 @@ func listContainers(auth Authenticator) func(w http.ResponseWriter, r *http.Requ
 			if len(image.RepoTags) > 0 {
 				container.Image = image.RepoTags[0]
 			}
-			container.Links.DownloadLog = newDownloadLogLink(container.ID)
+			container.Links.DownloadLog = newDownloadContainerLogLink(container.ID)
 			containers = append(containers, container)
 		}
 		b, err := json.Marshal(containers)
@@ -158,29 +161,46 @@ func downloadLog(containerID string, w http.ResponseWriter, r *http.Request) err
 	return nil
 }
 
-func errLogWrapper(auditLog *log.Logger, fn func(w http.ResponseWriter, r *http.Request) error) func(w http.ResponseWriter, r *http.Request) {
+func errLogWrapper(errLog, auditLog *log.Logger, fn func(w http.ResponseWriter, r *http.Request) error) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		auditLog.Printf("%s %s %s %s", r.RemoteAddr, r.Method, r.URL, r.UserAgent())
 		err := fn(w, r)
 		if err != nil {
+			errLog.Println(err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}
 }
 
-func authWrapper(auth Authenticator, fn func(containerID string, w http.ResponseWriter, r *http.Request) error) func(w http.ResponseWriter, r *http.Request) error {
+func authContainerWrapper(auth Authenticator, fn func(containerID string, w http.ResponseWriter, r *http.Request) error) func(w http.ResponseWriter, r *http.Request) error {
 	return func(w http.ResponseWriter, r *http.Request) error {
 		vars := mux.Vars(r)
 		containerID := vars["id"]
-		allowed, err := auth.IsAllowed(r, containerID)
+		allowed, err := auth.IsContainerAllowed(r, containerID)
 		if err != nil {
 			return err
 		}
 		if !allowed {
-			w.WriteHeader(http.StatusUnauthorized)
+			w.WriteHeader(http.StatusForbidden)
 			return nil
 		}
 		return fn(containerID, w, r)
+	}
+}
+
+func authServiceWrapper(auth Authenticator, fn func(serviceID string, w http.ResponseWriter, r *http.Request) error) func(w http.ResponseWriter, r *http.Request) error {
+	return func(w http.ResponseWriter, r *http.Request) error {
+		vars := mux.Vars(r)
+		serviceID := vars["id"]
+		allowed, err := auth.IsServiceAllowed(r, serviceID)
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			w.WriteHeader(http.StatusForbidden)
+			return nil
+		}
+		return fn(serviceID, w, r)
 	}
 }
 
@@ -198,11 +218,14 @@ func main() {
 		auth = NoOpAuthenticator{}
 	}
 
-	auditLog := log.New(os.Stdout, "AUDIT", log.LstdFlags)
+	auditLog := log.New(os.Stdout, "AUDIT ", log.LstdFlags)
+	errLog := log.New(os.Stdout, "ERROR ", log.LstdFlags)
 
 	s := r.PathPrefix("/api").Subrouter()
-	s.HandleFunc("/containers", errLogWrapper(auditLog, listContainers(auth)))
-	s.HandleFunc("/containers/{id}/log/download", errLogWrapper(auditLog, authWrapper(auth, downloadLog))).Methods("GET")
+	s.HandleFunc("/containers", errLogWrapper(errLog, auditLog, listContainers(auth)))
+	s.HandleFunc("/containers/{id}/log/download", errLogWrapper(errLog, auditLog, authContainerWrapper(auth, downloadLog))).Methods("GET")
+	s.HandleFunc("/services", errLogWrapper(errLog, auditLog, listServices(auth)))
+	s.HandleFunc("/services/{id}/log/download", errLogWrapper(errLog, auditLog, authServiceWrapper(auth, downloadLog))).Methods("GET")
 
 	r.PathPrefix("/").Handler(http.FileServer(http.Dir("/www")))
 	http.ListenAndServe(":80", r)
